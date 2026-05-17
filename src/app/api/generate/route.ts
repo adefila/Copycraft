@@ -1,10 +1,7 @@
-import Anthropic from '@anthropic-ai/sdk'
 import { NextRequest } from 'next/server'
 
 export const runtime = 'edge'
 export const maxDuration = 60
-
-const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
 
 const SYSTEM = `You are CopyCraft — an elite AI UX copywriter and conversion strategist.
 
@@ -128,28 +125,74 @@ ${ctx}`
 
 export async function POST(req: NextRequest) {
   try {
+    const apiKey = process.env.ANTHROPIC_API_KEY
+    if (!apiKey) {
+      return new Response(JSON.stringify({ error: 'ANTHROPIC_API_KEY not set' }), {
+        status: 500, headers: { 'Content-Type': 'application/json' }
+      })
+    }
+
     const { formData, mode, existingCopy } = await req.json()
-    const stream = await client.messages.stream({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 4000,
-      system: SYSTEM,
-      messages: [{ role: 'user', content: buildPrompt(formData || {}, mode || 'hero', existingCopy) }],
-    })
-    const enc = new TextEncoder()
-    return new Response(
-      new ReadableStream({
-        async start(ctrl) {
-          try {
-            for await (const chunk of stream) {
-              if (chunk.type === 'content_block_delta' && chunk.delta.type === 'text_delta')
-                ctrl.enqueue(enc.encode(chunk.delta.text))
-            }
-            ctrl.close()
-          } catch (e) { ctrl.error(e) }
-        }
+
+    const anthropicRes = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 4000,
+        stream: true,
+        system: SYSTEM,
+        messages: [{ role: 'user', content: buildPrompt(formData || {}, mode || 'hero', existingCopy) }],
       }),
-      { headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-cache' } }
-    )
+    })
+
+    if (!anthropicRes.ok) {
+      const err = await anthropicRes.text()
+      return new Response(JSON.stringify({ error: err }), { status: anthropicRes.status })
+    }
+
+    const encoder = new TextEncoder()
+    const decoder = new TextDecoder()
+
+    const readable = new ReadableStream({
+      async start(controller) {
+        const reader = anthropicRes.body?.getReader()
+        if (!reader) { controller.close(); return }
+        let buffer = ''
+        try {
+          while (true) {
+            const { done, value } = await reader.read()
+            if (done) break
+            buffer += decoder.decode(value, { stream: true })
+            const lines = buffer.split('\n')
+            buffer = lines.pop() || ''
+            for (const line of lines) {
+              if (!line.startsWith('data: ')) continue
+              const data = line.slice(6).trim()
+              if (data === '[DONE]') continue
+              try {
+                const parsed = JSON.parse(data)
+                if (parsed.type === 'content_block_delta' && parsed.delta?.type === 'text_delta') {
+                  controller.enqueue(encoder.encode(parsed.delta.text))
+                }
+              } catch { /* skip malformed lines */ }
+            }
+          }
+        } catch (e) {
+          controller.error(e)
+        } finally {
+          controller.close()
+        }
+      }
+    })
+
+    return new Response(readable, {
+      headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-cache' }
+    })
   } catch (e) {
     console.error(e)
     return new Response(JSON.stringify({ error: 'Generation failed' }), { status: 500 })
